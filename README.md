@@ -3,7 +3,7 @@
 The aim of this capstone project was to analyse the character network in Walt Disney films in the context of gender inequality. Datasets used are film transcript data of 25 Disney Princess and Pixar films. In social network analysis approach, three different methods were used. First, network plots of the character network in each film are shown to visualise the networks, focusing on the gender of each character. Second, three different centrality metrics are computed to identify important characters. Finally, `ergm` models are used to determine whether gender plays a role in the number of words spoken. 
 
 ## 1. Datasets 
-|  No    |  Film     |  Releasee Year | 
+|  No    |  Film     |  Release Year | 
 |  :---:  |    :---:    |    :----:   |
 |  1    | Snow White and the Seven Dwarfs      |  1937   | 
 |  2    | Cinderella   | 1950    | 
