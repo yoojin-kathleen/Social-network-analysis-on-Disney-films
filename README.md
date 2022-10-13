@@ -39,7 +39,10 @@ The final directed dialogue dataset had four columns: `from`, `text`, `directed`
 * `from` : the character who is speaking the dialogue
 * `to` : the character who the dialogue is spoken to, but only if the dialogue is directed. 
   * If it was the same character with different voice actors (e.g., when a character was young and then becomes an adult), or the same character who looks differently (e.g., when the Beast turns into a human), they were still seen as one unique character. 
-* `textt : the line of dialogue
+* `text` : the line of dialogue
 * `directed` : a binary variable of whether or not the dialogue is directed to a specific character
 
 For exploratory data analysis, this project used network plots that showed how each character interacts with one another based on dialogue relationships. The gender of the character was color coded and the extent of each dialogue relationsihp between two characters were weighted by edge width. Next, three centrality metrics were computed: in- and out-degree, betweenness, and closeness centrality. These measures are typically used in social network analysis to identify influential nodes. The aggregated and average values of each centrality were grouped by each gender for each film. Finally, exponential random graph models (ERGM) were fitted to determine whether gender plays a role in having a dialogue relationshup or not. 
+
+## 3. Results 
+Results are shown in seperate PDF files: `Disney-network-plots...pdf` and `Disney-ergm.pdf`. 
