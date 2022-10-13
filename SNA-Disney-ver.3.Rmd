@@ -1,0 +1,810 @@
+---
+title: "Social Network Analysis on Disney Films"
+author: "Kathleen Yoojin Jeong"
+date: "09/30/2022"
+output: html_document
+---
+
+```{r, warning=FALSE}
+suppressMessages({
+  library(stringr)
+  library(tidyverse)
+  library(gdata)
+  library(base)
+  library(scales)
+  library(RColorBrewer)
+  library(igraph)
+  library(qgraph)
+  library(ggpubr)
+  library(ggrepel)
+  library(ggpattern)
+  library(purrr)
+  library(ergm)
+  library(intergraph)
+  library(netplot)
+  library(broom)
+  library(pander)
+  library(gtools)
+  library(ggplot2)
+})
+```
+
+
+__Dataset explanations__
+
+Each film transcript dataset, which ends with `-cl-directed.csv`, has been already preprocessed to have four columns (`from`, `text`, `directed` and `to`) and each row as a line of dialogue. 
+
+* `from` : the character who speaks the dialogue 
+* `text` : the text of the dialogue
+* `directed` : whether or not the dialogue is directed to a specific character (`0` for No, `1` for Yes)
+* `to` : the character to whom the dialogue is directed to (it is left as blank if the dialogue is not directed)
+
+_Included datasets_
+
+|  No   |  Film     |  Release Year |  Shortened Title |
+| :---: |    :---:    |    :----:   |
+|  1    | Snow White and the Seven Dwarfs      |  1937   |  `snow` |
+|  2    | Cinderella   | 1950    |  `cind` |
+|  3    | Sleeping Beauty     |  1959    | `sleeping` |
+|  4    | Little Mermaid   | 1989   |   `mermaid` |
+|  5    | Beauty and the Beast      |  1991 |  `beauty` |
+|  6    | Aladdin   | 1992   | `aladdin` |
+|  7    | Pocahontas   | 1995     |  `poca` |
+|  8    | Toy Story 1   | 1995     | `toystory1` |
+|  9    | Mulan   | 1998   |  `mulan` |
+|  10    | Toy Story 2   | 1999     |  `toystory2` |
+|  11    | Little Mermaid 2   | 2000   |  `mermaid2` |
+|  12    | Finding Nemo   | 2003  |  `nemo` |
+|  13    | Incredibles   |   2004   |  `incredibles1` |
+|  14    | The Princess and the Frog   |   2009   |  `frog` |
+|  15    | Toy Story 3 |   2010   |  `toystory3` |
+|  16    | Tangled   |   2010   |  `tangled` |
+|  17    | Frozen   |   2013   |   `frozen` |
+|  18    |  Inside Out  |   2015   |  `inside` |
+|  19    | Moana   |   2016  |  `moana` |
+|  20    | Beauty and the Beast (Live-action)   |   2017   |  `beauty17` |
+|  21    | Incredibles 2   |   2018   |  `incredibles2` |
+|  22    | Aladdin (Live-action)   |   2019   |  `aladdin19` |
+|  23    | Frozen 2   |   2019  |  `frozen2` |
+|  24    | Toy Story 4   |   2019   |  `toystory4` |
+|  25    | Raya and the Last Dragon   |   2021   |  `raya` |
+
+
+### I. Define functions 
+
+__1. Open csv dataset and remove blank spaces__
+
+* `load_and_n_words` : Input is a shortened film title (string) (e.g., `snow`). The function loads the `-cl-directed.csv` file and creates a new column of the number of words for each dialogue. 
+* `remove_empty_space2` : Input is a dataframe of `-cl-directed`. The function removes all the leading and trailing blanks. 
+
+```{r}
+# Open csv file and add n_words column  
+load_and_n_words <- function(movie_name){
+  df_name <- paste0('1_directed-datasets/', movie_name, '-cl-directed.csv')
+  df <- read.csv(df_name, na.strings=NA, header = TRUE, sep = ",", encoding = "UTF-8")
+  
+  for (i in 1:nrow(df)){
+    df$nwords[i] <- str_count(df$text[i], '\\w+')
+  }
+  return(df)
+}
+
+# Remove leading and trailing blanks  
+remove_empty_space2 <- function(df){
+  df$from <- trim(df$from)
+  df$text <- trim(df$text)
+  df$directed <- trim(df$directed)
+  df$to <- trim(df$to)  
+  
+  return(df)
+}
+```
+
+
+__2. Compute number of words__
+
+* `create_df_directed` : Input is a dataframe of `-cl-directed`. The output is a dataframe of each dialogue relationship (unique pair of `from` and `to`), the total number of words of each relationship (`weight`), and the film which the relationship is from. 
+* `create_df_both` : Input is a dataframe of `-cl-directed`. The output is a dataframe of each character (`from`) and the total number of words spoken by each character.
+
+```{r}
+# Create a df with number of words of ONLY DIRECTED dialogues 
+create_df_directed <- function(df){
+  df_directed <- df %>% 
+    filter(df$directed == 1) %>% 
+    group_by(from, to) %>% 
+    summarize(weight = sum(nwords))
+  
+  df_directed <- merge(df_directed, df_0_all_movies[,c("from", "to", "movie")], by = c("from", "to"), all.x = TRUE)
+  df_directed <- df_directed[!duplicated(df_directed), ]
+  row.names(df_directed) <- 1:nrow(df_directed)
+  
+  return(df_directed)
+}
+
+# Create a df with number of words of ALL dialogues 
+create_df_both <- function(df){
+  df_both <- df %>% 
+    group_by(from) %>% 
+    summarize(n_words_total = sum(nwords))
+
+  row.names(df_both) <- 1:nrow(df_both)
+  
+  return(df_both)
+}
+```
+
+__3. Create `igraph` object__
+
+* `create_igraph` : Input is a dataframe of `-cl-directed`. The function creates a network object where each vertex (i.e., node) is a unique character and an edge represents a dialogue relationship. It also has number of total words spoken and gender as vertex attributes. 
+
+```{r}
+create_igraph <- function(df_movie){
+  # Compute number of words 
+  ## for (1) directed dialogues and (2) both directed and undirected 
+  my_df_dir <- df_movie %>% 
+    create_df_directed()
+  my_df_both <- df_movie %>% 
+    create_df_both()
+  
+  # Create character matrix (to create adjacency matrix)
+  chars <- my_df_both$from
+  from <- c()
+  to <- c()
+  
+  for (i in 1:length(chars)){
+    from <- append(from, rep(chars[i], times = length(chars)))
+    }
+  
+  to <- append(to, rep(chars, times = length(chars)))
+  my_char_mat <- data.frame(from, to) # my char matrix
+  remove(chars, from, to) # remove unnecessary objects 
+  
+  ## Merge n_words_dialogue to each directed dialogue 
+  my_char_mat <- merge(my_char_mat, 
+                       my_df_dir[,c("from", "to", "weight")],  
+                       by = c("from", "to"), 
+                       all.x = TRUE)
+  ## Remove duplicates
+  my_char_mat <- my_char_mat[!duplicated(my_char_mat), ]
+  
+  ## Merge gender to my_df_both 
+  named_char <- read.csv('0-named-char.csv', na.strings=NA, header = TRUE, sep = ",", encoding = "UTF-8") %>% 
+    rename(from = X.U.FEFF.from)
+  my_df_both <- merge(my_df_both, named_char[,c("from", "gender")], by = "from", all.x = TRUE)
+  
+  # Create graph object 
+  v <- unique(c(my_char_mat[,1], my_char_mat[,2]))
+  v <- na.omit(v)
+  e <- na.omit(my_char_mat)
+  g <- graph.data.frame(e, vertices = v, directed = T)
+  
+  # Add attributes 
+  V(g)$n_words_total <- my_df_both$n_words_total
+  V(g)$gender <- my_df_both$gender
+
+  return(g)
+  } # end of function definition 
+```
+
+__4. Visualize character network__
+
+* `plot_char_net_rm_isolates` : Inputs are a network object and a movie name (string). Output is a network plot where each node is a character and edge is a dialogue relationship between two characters. For the plot, isolates are removed, node size and edge width are weighted by the number of words spoken by each character, and the gender of each character are color coded.
+
+```{r}
+plot_char_net_rm_isolates <- function(my_network, my_movie){
+  # remove isolates
+  my_network <- delete_vertices(my_network, degree(my_network) == 0)
+  
+  # define layout 
+  e <- get.edgelist(my_network, names=FALSE)
+  ## set different layout for films with different number of vertices 
+  if (gorder(my_network) < 18){
+    my_layout <- qgraph.layout.fruchtermanreingold(e, vcount=vcount(my_network),
+                                                 area=2.2*(vcount(my_network)^1.15), repulse.rad=(vcount(my_network)^1))    
+  } else if (gorder(my_network) < 35){
+    my_layout <- qgraph.layout.fruchtermanreingold(e, vcount=vcount(my_network),
+                                                 area=2.25*(vcount(my_network)^2.1), repulse.rad=(vcount(my_network)^1.5))   
+  } else {
+    my_layout <- qgraph.layout.fruchtermanreingold(e, vcount=vcount(my_network),
+                                                 area=3*(vcount(my_network)^2.1), repulse.rad=(vcount(my_network)^1.5))   
+  }
+
+  # plot 
+  plot.igraph(my_network,
+              vertex.size = rescale(V(my_network)$n_words_total, c(3, 25)),
+              vertex.color = adjustcolor(ifelse(V(my_network)$gender == 0, "#009E73", 
+                      ifelse(V(my_network)$gender == 1, "#E69F00", "#999999")),
+                      alpha.f = .6),
+              vertex.label = ifelse(V(my_network)$name %in% named_char_major$from, V(my_network)$name, ""),
+              vertex.label.cex = rescale(V(my_network)$n_words_total, c(0.8, 1.6)),
+              vertex.label.family = "Cambria",
+              vertex.label.font = 2, # bold text 
+              vertex.label.color = "black",
+              edge.width = rescale(E(my_network)$weight, c(0.05, 10)), ###
+              edge.arrow.size = 0.45,
+              edge.color = adjustcolor("azure3", alpha.f = .6),
+              edge.curved = 0.25, 
+              layout = my_layout,
+              main = paste0("Character Network for <", my_movie, ">")
+              )
+  
+  legend("topright", legend = c("Woman", "Man"), 
+         inset=c(0.05, 0), cex = 0.9, pch = 19, 
+         col = c("#009E73", "#E69F00"), title = "Gender" 
+       )
+}
+
+```
+
+__5. Compute centrality__
+
+* `compute_centrality` : Inputs are a network object and a movie name (string). The output is a dataframe of in-degree, out-degree, betweenness, and closeness centrality metrics for each character. 
+
+```{r}
+compute_centrality <- function(my_network, my_movie){
+  # In- and out-degree centrality 
+  id <- degree(my_network, mode="in")
+  od <- degree(my_network, mode = "out")
+  # Betweenness
+  bet <- betweenness(my_network, weights = E(my_network)$weight)
+  # Closeness
+  clo <- closeness(my_network, weights = E(my_network)$weight)
+  
+  # n_words_total
+  n_words_total <- V(my_network)$n_words_total
+  
+  my_df <- data.frame(from=names(id), id=id, od=od, bet=bet, clo=clo, n_words = n_words_total, row.names=NULL)
+  my_df$movie <- my_movie
+  
+  remove(id, od, bet, clo)
+  
+  return(my_df)
+}
+```
+
+
+### II. Data cleaning  
+
+__1. Load each transcript__ : `df_3_[movie name]`
+
+```{r}
+# movie list in alphabetical order 
+movie_list <- c("aladdin19", "aladdin", "beauty17", "beauty", "brave", "cind", "frog", "frozen2", "frozen", 
+                "incredibles1", "incredibles2", "inside", "mermaid2", "mermaid", "moana", "mulan", "poca", "raya", 
+                "sleeping", "snow", "tangled", "toystory1", "toystory2", "toystory3", "toystory4")
+
+for (i in 1:length(movie_list)){
+  
+  tmp <- load_and_n_words(movie_list[i])
+  tmp$movie <- movie_list[i]
+  
+  assign(paste0("df_3_", movie_list[i]), tmp)
+}
+remove(tmp)
+```
+
+
+__2. Merge all preprocessed datasets__: `df_0_all_movies`
+
+```{r}
+# Merge all preprocessed data of all films 
+
+# movie list in release year order 
+movie_list <- c("snow", "cind", "sleeping", "mermaid", "mermaid2", "beauty", "beauty17", "aladdin", "aladdin19",
+                "poca", "mulan", "frog", "tangled", "brave", "frozen", "frozen2", "moana", "raya", 
+                "toystory1", "toystory2", "toystory3", "toystory4", 
+                "incredibles1", "incredibles2", "inside")
+df_0_all_movies <- data.frame()
+for (i in 1:length(movie_list)){
+  df_tmp <- load_and_n_words(movie_list[i])
+  df_tmp$movie <- movie_list[i]
+  df_0_all_movies <- rbind(df_0_all_movies, df_tmp) %>% 
+    remove_empty_space2
+}
+remove(df_tmp)
+```
+
+
+__3. Calculate number of words__ : `df_1_dir` for directed dialogues only and `df_1_both` for both
+
+```{r}
+# For each directed dialogue
+df_1_dir <- create_df_directed(df_0_all_movies)
+
+# For each character 
+df_1_both <- create_df_both(df_0_all_movies)
+
+# Get all unique characters who interacted with another (either from or to)
+all_char <- append(df_1_dir$from, df_1_dir$to) %>% unique()
+df_1_char <- data.frame(from = all_char)
+df_1_char <- merge(df_1_char, df_1_dir[,c("from", "movie")], by = "from") %>% unique() %>% arrange(movie)
+
+# Save to csv 
+write.csv(df_1_char,"0_unique_char.csv", row.names = F, fileEncoding = 'utf8')
+```
+
+
+__4. Create igraph object__ (`net_[movie name]`)
+
+```{r, warning=FALSE, message=FALSE}
+movie_list <- c("snow", "cind", "sleeping", "mermaid", "mermaid2", "beauty", "beauty17", "aladdin", "aladdin19",
+                "poca", "mulan", "frog", "tangled", "brave", "frozen", "frozen2", "moana", "raya", 
+                "toystory1", "toystory2", "toystory3", "toystory4", 
+                "incredibles1", "incredibles2", "inside", "nemo")
+
+for (i in 1:length(movie_list)){
+  tmp <- load_and_n_words(movie_list[i])
+  tmp$movie <- movie_list[i]
+  
+  my_net <- create_igraph(tmp)
+  
+  assign(paste0("net_", movie_list[i]), my_net)
+  remove(tmp, my_net)
+}
+```
+
+### III. Data analysis  
+
+__1. Character network plot__
+
+```{r, fig.height=8, fig.width=8, warning = FALSE, message = FALSE}
+named_char_major <-  read.csv('0-named-char-major2.csv', na.strings=NA, header = TRUE, sep = ",", encoding = "UTF-8") %>%
+  rename(from = X.U.FEFF.from)
+
+movie_list <- c("snow", "cind", "sleeping", "mermaid", "mermaid2", "beauty", "beauty17", "aladdin", "aladdin19",
+                "poca", "mulan", "frog", "tangled", "brave", "frozen", "frozen2", "moana", "raya",
+                "toystory1", "toystory2", "toystory3", "toystory4",
+                "incredibles1", "incredibles2", "inside", "nemo")
+movie_name_list <- c("Snow White and the Seven Dwarfs", "Cinderella", "Sleeping Beauty", "Litte Mermaid", "Little Mermaid 2",
+                     "Beauty and the Beast", "Beauty and the Beast (2017)", "Aladdin", "Aladdin (2019)",
+                     "Pocahontas", "Mulan", "Princess and the Frog", "Tangled", "Brave", "Frozen", "Frozen 2", "Moana", "Raya and the Last Dragon",
+                     "Toy Story 1", "Toy Story 2", "Toy Story 3", "Toy Story 4",
+                     "Incredibles", "Incredibles 2", "Inside Out", "Finding Nemo")
+
+plot_list = list()
+for (i in 1:length(movie_list)){
+  # load each movie 
+  tmp <- load_and_n_words(movie_list[i])
+  tmp$movie <- movie_list[i]
+  
+  # create network
+  my_net <- create_igraph(tmp)
+  # save network object
+  assign(paste0("net_", movie_list[i]), my_net)   
+  
+  # plot
+  my_plot <- plot_char_net_rm_isolates(my_net, movie_name_list[i])
+  my_plot
+  
+  # # save plots to a list
+  # plot_list[[i]] <- my_plot
+  # ggsave(plot = my_plot, filename = paste0("3_network_plots/", movie_name_list[i],".png"), width = 14, height = 10, units = "cm")
+
+  
+  # ggsave(my_plot, file=paste0("3_network_plots/", movie_name_list[i], ".png"), width = 14, height = 10, units = "cm")
+  
+  # remove(tmp, my_net, my_plot)
+}
+
+```
+
+
+
+__2. Compute centrality__ : `df_2_centrality`
+
+```{r, warning = FALSE}
+# Apply 
+movie_list <- c("snow", "cind", "sleeping", "mermaid", "mermaid2", "beauty", "beauty17", "aladdin", "aladdin19",
+                "poca", "mulan", "frog", "tangled", "brave", "frozen", "frozen2", "moana", "raya", 
+                "toystory1", "toystory2", "toystory3", "toystory4", 
+                "incredibles1", "incredibles2", "inside", "nemo")
+year_list <- c(1937, 1950, 1959, 1989, 2000, 1991, 2017, 1992, 2019, 
+               1995, 1998, 2009, 2010, 2012, 2013, 2019, 2016, 2021,
+               1995, 1999, 2010, 2019, 
+               2004, 2018, 2015, 2003)
+
+df_2_centrality <- data.frame()
+for (i in 1:length(movie_list)){
+  tmp <- load_and_n_words(movie_list[i])
+  tmp$movie <- movie_list[i]
+  
+  my_net <- create_igraph(tmp)
+  my_centrality <- compute_centrality(my_net, movie_list[i])
+  
+  df_2_centrality <- rbind(df_2_centrality, my_centrality)
+  remove(tmp, my_net)
+}
+
+# Get character names 
+named_char <- read.csv('0-named-char.csv', na.strings=NA, header = TRUE, sep = ",", encoding = "UTF-8") %>% 
+  rename(from = X.U.FEFF.from)
+char_names <- named_char$from
+
+# Get years 
+year <- read.csv('0-year.csv', na.strings=NA, header = TRUE, sep = ",", encoding = "UTF-8") %>% 
+  rename(movie = X.U.FEFF.movie)
+
+# Merge char names and year 
+df_2_centrality <- merge(df_2_centrality, named_char[,c("from", "gender")], by = "from", all.x = TRUE) 
+
+for (i in 1:length(movie_list)){
+  df_2_centrality$year[df_2_centrality$movie == movie_list[i]] <- year_list[i]
+}
+df_2_centrality$year <- as.factor(df_2_centrality$year)
+
+remove(id, od, bet, clo)
+```
+
+Because there are some characters that the gender is not obvious, the `df_2_centrality_cl` dataset removes them. 
+
+```{r, fig.width=10, fig.height=5}
+# Get clean version of df_2_centrality
+df <- df_2_centrality %>% 
+  drop_na(gender) %>% 
+  group_by(movie) %>% 
+  mutate(n_words_perc = round(n_words/sum(n_words)*100, 2)) %>% 
+  arrange(year, from)
+
+df_2_centrality_cl <- df 
+
+df$pixar <- ifelse(grepl("toystory", df$movie), "Pixar", 
+                   ifelse(grepl("incredibles", df$movie), "Pixar", "DisneyPrincess"))
+```
+
+
+
+__3. Data visualisation__ 
+
+_1) Total number of words_
+
+```{r, fig.height=5.5, fig.width=8}
+# Get a dataframe of film titles, year, company
+df_4_movie_name <- read.csv('0_movie_name.csv', na.strings=NA, header = TRUE, sep = ",", encoding = "UTF-8") %>% 
+  rename(movie = X.U.FEFF.movie) 
+
+# n_words_total aggregated by gender 
+df_2_perc_words <- df_2_centrality_cl %>%
+  group_by(movie, gender) %>% 
+  summarize(perc_subtotal = sum(n_words_perc), 
+            pop_subtotal = n()) %>% 
+  mutate(perc_per = perc_subtotal/pop_subtotal)
+
+df_2_perc_words <- merge(df_2_perc_words, 
+                         df_2_centrality_cl[,c("movie", "year", "gender")], 
+                         by = c("movie", "gender"), 
+                         all.x = TRUE) %>% unique() 
+df_2_perc_words <- merge(df_2_perc_words, 
+                         df_4_movie_name[,c("movie", "company", "movie_name")], 
+                         by = c("movie"), 
+                         all.x = TRUE) 
+df <- df_2_perc_words
+
+df_tmp <- df %>% filter(gender == 0)
+
+
+# Subtotal for all women  
+ggplot(df, 
+       aes(x=reorder(movie_name, as.numeric(year)), y=perc_subtotal, group = as.factor(gender)), label = df_tmp$movie_name) +
+  geom_line(aes(color=as.factor(gender)), cex = 0.45)+
+  geom_point(aes(color=as.factor(gender), shape = company), cex = 2.5) +
+  scale_color_manual(values = c("#009E73", "#E69F00"), name = "Gender", labels = c("Woman", "Man")) +
+  scale_shape_manual(values=c(16, 3), name = "Company") + 
+  ylab("% of number of words spoken") + 
+  xlab("Film") + 
+  ggtitle("How much do women characters talk?") + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(size = 8, angle = 90, vjust = 0.5, hjust=1),
+        plot.title = element_text(size=14, face="bold")) 
+remove(df_tmp)
+
+# Per person for each gender 
+ggplot(df, aes(x=reorder(movie_name, as.numeric(year)), y=perc_per, group = as.factor(gender)), label = df$movie_name) +
+  geom_line(aes(color=as.factor(gender)), cex = 0.45)+
+  geom_point(aes(color=as.factor(gender), shape = company), cex = 2.5) +
+  scale_color_manual(values = c("#009E73", "#E69F00"), name = "Gender", labels = c("Woman", "Man")) +
+  scale_shape_manual(values=c(16, 3), name = "Company", labels = c("Disney Princess", "Pixar")) +
+  ylab("% of number of words spoken (per person)") + 
+  xlab("Film") + 
+  ggtitle("How much do each gender talk per one person?") + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(size = 8, angle = 90, vjust = 0.5, hjust=1),
+        plot.title = element_text(size=14, face="bold")) 
+```
+
+```{r, fig.height=7, fig.width=8}
+df <- df_2_perc_words
+df_tmp <- df %>% filter(gender == 1) %>% 
+  mutate(men_talk = perc_subtotal)
+
+df <- merge(df, df_tmp[,c("movie_name", "men_talk")], by = "movie_name", all.x = TRUE)
+df
+
+# Subtotal for all women  
+ggplot(df, 
+       aes(x=reorder(movie_name, as.numeric(men_talk)), 
+           y=perc_subtotal, 
+           fill = as.factor(gender),
+           pattern= company)) +
+  geom_bar_pattern(position = "fill", stat = "identity", width = 0.5,
+                   color = "black", 
+                   pattern_fill = "darkgrey",
+                   pattern_angle = 45,
+                   pattern_density = 0.03,
+                   pattern_spacing = 0.04,
+                   pattern_key_scale_factor = 0.6,
+                   pattern_alpha = 0.6,
+                   alpha = 0.7) + 
+  scale_fill_manual(values = c("#009E73", "#E69F00"), name = "Gender", labels = c("Woman", "Man")) +
+  scale_pattern_manual(values = c(DisneyPrincess = "none", Pixar = "stripe"), name = "Company",
+                       labels = c("Disney Princess", "Pixar")) + 
+  ylab("Percent of number of words spoken") + 
+  scale_y_continuous(expand = c(0, 0)) +
+  xlab("Film") + 
+  ggtitle("How much do women characters talk?") + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(size = 8, angle = 90, vjust = 0.5, hjust=1),
+        plot.title = element_text(size=14, face="bold")) +
+  coord_flip()
+```
+
+* Reference : https://stackoverflow.com/questions/22945651/remove-space-between-plotted-data-and-the-axes
+ 
+_2) Centrality_ 
+
+```{r}
+# centrality aggregated by gender 
+df_2_cent_agg <- df_2_centrality_cl %>%
+  group_by(movie, gender) %>% 
+  summarize(id_subtotal = sum(id),
+            od_subtotal = sum(od),
+            bet_subtotal = sum(bet), 
+            clo_subtotal = sum(clo),
+            pop_subtotal = n()) %>% 
+  mutate(id_avg = id_subtotal/pop_subtotal,
+         od_avg = od_subtotal/pop_subtotal, 
+         bet_avg = bet_subtotal/pop_subtotal,
+         clo_avg = clo_subtotal/pop_subtotal)
+
+df_2_cent_agg <- merge(df_2_cent_agg, 
+                         df_2_centrality_cl[,c("movie", "year", "gender")], 
+                         by = c("movie", "gender"), 
+                         all.x = TRUE) %>% unique() 
+df_2_cent_agg <- merge(df_2_cent_agg, 
+                         df_4_movie_name[,c("movie", "company", "movie_name")], 
+                         by = c("movie"), 
+                         all.x = TRUE) 
+df <- df_2_cent_agg
+
+df
+
+# centrality measures 
+
+centrality_lineplot <- function(y, ylab, title, subtitle){
+  p <- ggplot(df, 
+       aes(x=reorder(movie_name, as.numeric(year)), y=y, group = as.factor(gender)), label = df$movie_name) +
+  geom_line(aes(color=as.factor(gender)), cex = 0.45)+
+  geom_point(aes(color=as.factor(gender), shape = company), cex = 2.5) +
+
+  scale_color_manual(values = c("#009E73", "#E69F00"), name = "Gender", labels = c("Woman", "Man")) +  
+  scale_shape_manual(values=c(16, 3), name = "Company") + 
+  ylab("") + 
+  xlab("Film") + 
+  labs(title = title,
+       subtitle = subtitle) + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(size = 8, angle = 90, vjust = 0.5, hjust=1),
+        plot.title = element_text(size = 13, face="bold")) 
+  
+  return(p)
+}
+```
+
+```{r, fig.width=9, fig.height=5}
+centrality_lineplot(df$id_subtotal, "In-degree centrality (subtotal)", "Are women spoken to more characters than men?", "Indegree centrality (subtotal)")
+centrality_lineplot(df$id_avg, "In-degree centrality (average)", "Is one woman spoken to more characters than one man?", "Indegree centrality (average)")
+centrality_lineplot(df$od_subtotal, "Out-degree centrality (subtotal)", "Do women speak to more characters than men?", "Outdegree centrality (subtotal)")
+centrality_lineplot(df$od_avg, "Out-degree centrality (average)", "Does one woman speak to more characters than one man?", "Outdegree centrality (average)")
+centrality_lineplot(df$bet_subtotal, "Betweenness centrality (subtotal)", "Are women acting like a bridge more than men?", "Betweenness centrality (subtotal)")
+centrality_lineplot(df$bet_avg, "Betweenness centrality (average)", "Does one woman act like a bridge more than one man?", "Betweenness centrality (average)")
+centrality_lineplot(df$clo_subtotal, "Closeness centrality (subtotal)", "Are women in the center of the network?", "Closeness centrality (subtotal)")
+centrality_lineplot(df$clo_avg, "Closeness centrality (average)", "Is one woman in the center more than one man?", "Closeness centrality (average)")
+```
+
+
+* Reference: https://stackoverflow.com/questions/29357612/plot-labels-at-ends-of-lines
+
+_3) Films with sequels or live-action adaptations_
+
+```{r}
+ts <- c("toystory1", "toystory2", "toystory3", "toystory4")
+inc <- c("incredibles1", "incredibles2")
+mer <- c("mermaid", "mermaid2") 
+ala <- c("aladdin", "aladdin19")
+bea <- c("beauty", "beauty17")
+fro <- c("frozen", "frozen2")
+
+seq <- c("toystory1", "toystory2", "toystory3", "toystory4", "incredibles1", "incredibles2", 
+         "mermaid", "mermaid2", "aladdin", "aladdin19", "beauty", "beauty17", "frozen", "frozen2")
+
+df_tmp <- df_2_perc_words %>% 
+  filter(movie %in% seq) %>% 
+  mutate(series = ifelse(movie %in% ts, "Toy Story", 
+                         ifelse(movie %in% inc, "Incredibles", 
+                                ifelse(movie %in% mer, "Little Mermaid", 
+                                       ifelse(movie %in% ala, "Aladdin", 
+                                              ifelse(movie %in% bea, "Beauty and the Beast", "Frozen"))))))
+# Subtotal for all women  
+ggplot(df_tmp, 
+       aes(x=movie_name, y=perc_subtotal, group = as.factor(gender)), label = df_tmp$movie_name) +
+  geom_line(aes(color=as.factor(gender)), cex = 0.45)+
+  geom_point(aes(color=as.factor(gender), shape = company), cex = 2.5) +
+  scale_color_manual(values = c("#009E73", "#E69F00"), name = "Gender", labels = c("Woman", "Man")) +
+  scale_shape_manual(values=c(16, 3), name = "Company") + 
+  ylab("% of number of words spoken") + 
+  xlab("Film") + 
+  ggtitle("How much do women characters talk?") + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(size = 8, angle = 90, vjust = 0.5, hjust=1),
+        plot.title = element_text(size=14, face="bold"),
+        strip.text = element_blank()) +
+  facet_grid(. ~ series, scales = "free")
+
+# Per person for each gender 
+ggplot(df_tmp, 
+       aes(x=movie_name, y=perc_per, group = as.factor(gender)), label = df_tmp$movie_name) +
+  geom_line(aes(color=as.factor(gender)), cex = 0.45)+
+  geom_point(aes(color=as.factor(gender), shape = company), cex = 2.5) +
+  scale_color_manual(values = c("#009E73", "#E69F00"), name = "Gender", labels = c("Woman", "Man")) +
+  scale_shape_manual(values=c(16, 3), name = "Company") +
+  ylab("% of number of words spoken (per person)") + 
+  xlab("Film") + 
+  ggtitle("How much do each gender talk per one person?") + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(size = 8, angle = 90, vjust = 0.5, hjust=1),
+        plot.title = element_text(size=14, face="bold"),
+        strip.text = element_blank()) +
+  facet_grid(. ~ series, scales = "free")
+remove(df_tmp)
+```
+
+
+
+### IV. `ERGM` modeling  
+
+```{r, warning = FALSE, message = FALSE, include = FALSE}
+# Apply 
+movie_list <- c("snow", "cind", "sleeping", "mermaid", "mermaid2", "beauty", "beauty17", "aladdin", "aladdin19",
+                "poca", "mulan", "frog", "tangled", "brave", "frozen", "frozen2", "moana", "raya", 
+                "toystory1", "toystory2", "toystory3", "toystory4", 
+                "incredibles1", "incredibles2", "inside", "nemo")
+
+mod_list <- list()
+
+for (i in 1:length(movie_list)){
+  # Load data 
+  tmp <- load_and_n_words(movie_list[i])
+  tmp$movie <- movie_list[i]
+  
+  # Create igraph object 
+  my_net <- create_igraph(tmp)
+  
+  # Delete vertices without gender value 
+  my_net <- delete_vertices(my_net, 
+                                V(my_net)[is.na(gender)])
+  # Compute mean and median of total number of words 
+  my_mean <- mean(V(my_net)$n_words_total)
+  my_median <- median(V(my_net)$n_words_total)
+  
+  # Create node attributes
+  V(my_net)$n_words_cat_mean <- ifelse(V(my_net)$n_words_total > my_mean, "higher_mean", "lower_mean")
+  V(my_net)$n_words_cat_med <- ifelse(V(my_net)$n_words_total > my_median, "higher_med", "lower_med")
+  
+  # Convert to ergm object 
+  my_ergm <- asNetwork(my_net)
+  
+  # Model ergm  
+  m1 <- ergm(my_ergm ~ edges 
+           + nodefactor("gender")
+           + nodematch("gender"))
+    
+  m2 <- ergm(my_ergm ~ edges 
+           + nodefactor("gender")
+           + nodefactor("n_words_cat_mean")
+           + nodematch("gender"))
+ 
+  m3 <- ergm(my_ergm ~ edges 
+         + nodefactor("gender")
+         + nodefactor("n_words_cat_med")
+         + nodematch("gender"))
+ 
+  m4 <- ergm(my_ergm ~ edges 
+         + nodefactor("gender")
+         + nodecov("n_words_total")
+         + nodematch("gender"))
+
+  # Save to csv 
+  m1_tidy <- tidy(m1, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.95,
+                  AIC = TRUE, BIC = TRUE) %>%
+    mutate(signif = stars.pval(p.value))
+  m2_tidy <- tidy(m2, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.95,
+                  AIC = TRUE, BIC = TRUE)  %>%
+    mutate(signif = stars.pval(p.value))
+  m3_tidy <- tidy(m3, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.95,
+                  AIC = TRUE, BIC = TRUE) %>%
+    mutate(signif = stars.pval(p.value))
+  m4_tidy <- tidy(m4, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.95,
+                  AIC = TRUE, BIC = TRUE) %>%
+    mutate(signif = stars.pval(p.value))
+  
+  # save models to csv
+  write.csv(m1_tidy, file.path("4_ergm_models/", paste0("m1_", movie_list[i], ".csv")))
+  write.csv(m2_tidy, file.path("4_ergm_models/", paste0("m2_", movie_list[i], ".csv")))
+  write.csv(m3_tidy, file.path("4_ergm_models/", paste0("m3_", movie_list[i], ".csv")))
+  write.csv(m4_tidy, file.path("4_ergm_models/", paste0("m4_", movie_list[i], ".csv")))
+  
+  remove(tmp, my_net, my_ergm, m1, m2, m3, m4)
+}
+```
+
+```{r}
+files <- list.files(path = "4_ergm_models/")
+
+df_5_ergm <- data.frame()
+for (i in 1:length(files)) {
+  df_tmp = read.csv(paste0("4_ergm_models/", files[i]), header = T, sep = ",")
+  df_tmp = subset(df_tmp, select = -c(std.error, mcmc.error, statistic, p.value))
+
+  df_5_ergm <- rbind(df_5_ergm, df_tmp)
+}
+write.csv(df_5_ergm, file.path("4_ergm_models_edited/0_ergm_models.csv"))
+```
+
+
+```{r}
+# Apply 
+movie_list <- c("snow", "cind", "sleeping", "mermaid", "mermaid2", "beauty", "beauty17", "aladdin", "aladdin19",
+                "poca", "mulan", "frog", "tangled", "brave", "frozen", "frozen2", "moana", "raya", 
+                "toystory1", "toystory2", "toystory3", "toystory4", 
+                "incredibles1", "incredibles2", "inside", "nemo")
+
+# rbind all films into one dataframe for each model 
+df_5_m1 <- data.frame()
+df_5_m2 <- data.frame()
+df_5_m3 <- data.frame()
+df_5_m4 <- data.frame()
+
+for (i in 1:4){
+  df_tmp1 <- data.frame()
+  
+  for (j in 1:length(movie_list)){
+    df_tmp2 <- read.csv(paste0("4_ergm_models/m", i, "_", movie_list[j], ".csv"), 
+                       na.strings=NA, header = TRUE, sep = ",", encoding = "UTF-8")
+    df_tmp2$film <- ""
+    df_tmp2$film[1] <- movie_list[j]
+    df_tmp2 <- df_tmp2 %>% 
+      select(film, everything())
+    
+    df_tmp1 <- rbind(df_tmp1, df_tmp2)
+  }
+  if (i == 1){
+    df_5_m1 <- df_tmp1
+  }
+  if (i == 2){
+    df_5_m2 <- df_tmp1
+  }
+  if (i == 3){
+    df_5_m3 <- df_tmp1
+  }
+  if (i == 4){
+    df_5_m4 <- df_tmp1
+  }
+}
+
+# Save as csv 
+write.csv(df_5_m1, file.path("4_ergm_models_edited/m1.csv"))
+write.csv(df_5_m2, file.path("4_ergm_models_edited/m2.csv"))
+write.csv(df_5_m3, file.path("4_ergm_models_edited/m3.csv"))
+write.csv(df_5_m4, file.path("4_ergm_models_edited/m4.csv"))
+
+```
+
